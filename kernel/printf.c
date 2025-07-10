@@ -176,3 +176,29 @@ printfinit(void)
   initlock(&pr.lock, "pr");
   pr.locking = 1;
 }
+
+void
+backtrace(void)
+{
+  printf("backtrace:\n");
+
+  // 获取当前的帧指针 (Frame Pointer)
+  uint64 fp = r_fp();
+  
+  // 获取当前栈页的底部地址，用于判断回溯何时结束
+  uint64 stack_bottom = PGROUNDDOWN(fp);
+  // 获取当前栈页的顶部地址
+  uint64 stack_top = PGROUNDUP(fp);
+
+  // 循环向上遍历栈帧
+  while (fp >= stack_bottom && fp < stack_top) {
+    // 1. 获取并打印返回地址
+    // 返回地址存储在 fp - 8 的位置
+    uint64 return_addr = *(uint64*)(fp - 8);
+    printf("%p\n", (uint64*)return_addr);
+
+    // 2. 获取上一个栈帧的帧指针，为下一次循环做准备
+    // 上一个帧指针存储在 fp - 16 的位置
+    fp = *(uint64*)(fp - 16);
+  }
+}
