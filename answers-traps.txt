@@ -1,0 +1,139 @@
+
+问题 1:
+
+Which registers contain arguments to functions? For example, which register holds 13 in main's call to printf?
+
+哪个寄存器包含函数的参数？例如，在 main 对 printf 的调用中，哪个寄存器持有值 13？
+
+答：
+根据RISC-V的调用约定（Calling Convention），函数的前8个整型或指针参数是通过寄存器 a0 到 a7 来传递的。
+
+第1个参数在 a0
+
+第2个参数在 a1
+
+第3个参数在 a2
+
+...以此类推，直到 a7。
+
+在 user/call.c 的 main 函数中，调用了 printf("%d %d\n", f(8, 9), 13);。
+
+第一个参数是格式化字符串 "%d %d\n" 的地址，它会被放入 a0。
+
+第二个参数是函数 f(8, 9) 的返回值，它会被放入 a1。
+
+第三个参数是整数 13，它会被放入 a2。
+
+因此，寄存器 a2 持有值 13。
+
+问题 2:
+
+Where is the call to function f in the assembly code for main? Where is the call to g? (Hint: the compiler may inline functions.)
+
+在 main 的汇编代码中，对函数 f 的调用在哪里？对函数 g 的调用又在哪里？（提示：编译器可能会内联函数。）
+
+答：
+通过查看 user/call.asm 文件中 main 函数的汇编代码：
+
+对函数 f 的调用是存在的。 你可以找到类似 jal (Jump and Link Register) 的指令，它跳转到 f 函数的地址。在这条指令之前，会有几条指令将参数 8 和 9 加载到寄存器 a0 和 a1 中。
+
+在汇编代码中找不到对函数 g 的直接调用。 你不会看到一条 jal 指令跳转到 g 的地址。
+
+这是因为编译器进行了内联优化（inlining）。编译器分析 g 函数 (return x+y+z;) 后发现它非常简单，为了提高效率，它没有生成一个真正的函数调用（这需要保存/恢复寄存器、跳转等开销），而是直接将 g 函数的功能嵌入到了 main 函数内部。在 g(1, 2, 3, ...) 这个调用中，编译器在编译时就直接计算出了结果 1+2+3=6，然后在需要使用这个结果的地方直接使用了值 6。
+
+问题 3:
+
+At what address is the function printf located?
+
+函数 printf 位于哪个地址？
+
+答：
+这个地址需要查看 user/call.asm 文件来确定。在文件中搜索 printf: 标签，标签所在行的开头就会显示它的地址。这个地址在不同的编译环境下可能会有微小的差异。
+00000000000006e2 <printf>:
+
+问题 4:
+
+What value is in the register ra just after the jalr to printf in main?
+
+在 main 中，执行完调用 printf 的 jal 指令后，寄存器 ra 中的值是什么？
+
+答：
+ra 寄存器（Return Address Register）的作用是存储函数的返回地址。jal 指令在跳转到目标函数（这里是printf）的同时，会把下一条指令的地址保存到 ra 寄存器中。这样，当 printf 函数执行完毕后，CPU可以通过 ret 指令（实际上是 jal x0, ra, 0）跳转回 ra 中保存的地址，继续执行 main 函数中剩下的代码。
+
+因此，ra 中的值就是 main 函数里那条调用 printf 的 jal 指令的下一条指令的地址。你可以在 call.asm 文件中找到这条 jal 指令，并记下它后面那条指令的地址(0x3c)。
+
+问题 5 (代码片段 1):
+
+Run the following code.
+What is the output? ... If the RISC-V were instead big-endian what would you set i to ...? Would you need to change 57616 ...?
+
+运行以下代码，输出是什么？... 如果RISC-V是大端字节序，为了得到相同输出，i 的值应该设置成什么？需要改变 57616 吗？
+
+Generated c
+unsigned int i = 0x00646c72;
+printf("H%x Wo%s", 57616, (char *) &i);
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+C
+IGNORE_WHEN_COPYING_END
+
+答：
+
+输出是什么？
+这道题考察了 printf 的格式化输出和 小端（little-endian） 字节序。
+
+H%x: printf 会将十进制数 57616 转换为十六进制打印。57616 (十进制) = E110 (十六进制)。所以这部分输出 HE110。
+
+Wo%s: printf 会将 (char *) &i 当作一个字符串的起始地址来打印。
+
+整数 i 的值是 0x00646c72。
+
+因为RISC-V是小端字节序，最低有效字节存储在最低的内存地址。所以这4个字节在内存中的存储顺序是：72 6c 64 00。
+
+将这些十六进制值作为ASCII码解释：0x72 是 'r'，0x6c 是 'l'，0x64 是 'd'，0x00 是字符串的结束符 \0。
+
+所以 %s 会打印出字符串 "rld"。
+
+最终输出是：HE110 World
+
+如果是大端（big-endian）字节序：
+
+i 的值应该设置成什么？
+在大端模式下，字节按原样存储，即 00 64 6c 72。printf 读到第一个字节 00 就会认为字符串结束了，什么也打印不出来。
+为了得到相同的输出 "rld"，我们需要让内存中的字节顺序依然是 72 6c 64 00。在大端模式下，这意味着整数 i 的值必须被设置为 0x726c6400。
+
+需要改变 57616 吗？
+不需要。 57616 是一个按值传递的整型参数。它在被放入寄存器时，其数值本身与计算机的内存字节序无关。所以这个值不需要改变。
+
+问题 6 (代码片段 2):
+
+In the following code, what is going to be printed after ' y= ' ? (note: the answer is not a specific value.) Why does this happen?
+
+在下面的代码中，' y= ' 后面会打印出什么？（注意：答案不是一个具体的数值。）这为什么会发生？
+
+Generated c
+printf("x=%d y=%d", 3);
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+C
+IGNORE_WHEN_COPYING_END
+
+答：
+
+' y= ' 后面将会打印一个不确定的、随机的“垃圾值” (a random/garbage value)。
+
+原因如下：
+
+printf 是一个可变参数函数，它完全依赖于格式化字符串来确定需要从哪里获取多少个参数。
+
+当 printf 解析到第一个 %d 时，它会根据调用约定去寻找第二个参数（第一个是格式化字符串本身）。在RISC-V中，它会去读取寄存器 a1 的值。我们的代码正确地将 3 传入了这个位置，所以 x=3 被正确打印。
+
+当 printf 解析到第二个 %d 时，它会继续去寻找第三个参数，也就是去读取寄存器 a2 的值。
+
+但是，我们的代码在调用时只提供了一个有效参数 3，并没有向 a2 寄存器中放入任何为这次调用准备的值。
+
+因此，printf 会直接使用 a2 寄存器中当前碰巧存在的任何值。这个值是之前其他代码执行后遗留下来的，对于本次调用来说是完全随机和无意义的。所以打印出来的是一个垃圾值。
