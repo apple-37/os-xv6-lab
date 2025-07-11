@@ -187,3 +187,10 @@ void            virtio_disk_intr(void);
 
 // number of elements in fixed-size array
 #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+
+
+
+// 在kalloc.c部分添加
+void krefpage(void*);
+// 在vm.c部分添加
+int cowfault(pagetable_t, uint64);

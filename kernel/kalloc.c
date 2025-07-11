@@ -22,11 +22,19 @@ struct {
   struct spinlock lock;
   struct run *freelist;
 } kmem;
+// 在文件开头添加
+struct {
+  struct spinlock lock;
+  int count[(PHYSTOP - KERNBASE) / PGSIZE];
+} refcount;
 
-void
-kinit()
-{
+static int pa2index(uint64 pa) {
+  return (pa - KERNBASE) / PGSIZE;
+}
+// 修改kinit()
+void kinit() {
   initlock(&kmem.lock, "kmem");
+  initlock(&refcount.lock, "refcount");
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -43,19 +51,22 @@ freerange(void *pa_start, void *pa_end)
 // which normally should have been returned by a
 // call to kalloc().  (The exception is when
 // initializing the allocator; see kinit above.)
-void
-kfree(void *pa)
-{
+// 修改kfree()
+void kfree(void *pa) {
   struct run *r;
-
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
+  acquire(&refcount.lock);
+  int idx = pa2index((uint64)pa);
+  if(--refcount.count[idx] > 0) {
+    release(&refcount.lock);
+    return;
+  }
+  release(&refcount.lock);
+
   memset(pa, 1, PGSIZE);
-
   r = (struct run*)pa;
-
   acquire(&kmem.lock);
   r->next = kmem.freelist;
   kmem.freelist = r;
@@ -65,18 +76,31 @@ kfree(void *pa)
 // Allocate one 4096-byte page of physical memory.
 // Returns a pointer that the kernel can use.
 // Returns 0 if the memory cannot be allocated.
-void *
-kalloc(void)
-{
+// 修改kalloc()
+void *kalloc(void) {
   struct run *r;
-
   acquire(&kmem.lock);
   r = kmem.freelist;
-  if(r)
+  if(r) {
     kmem.freelist = r->next;
+    acquire(&refcount.lock);
+    refcount.count[pa2index((uint64)r)] = 1;
+    release(&refcount.lock);
+  }
   release(&kmem.lock);
-
-  if(r)
-    memset((char*)r, 5, PGSIZE); // fill with junk
+  
+  if(r) memset((char*)r, 5, PGSIZE);
   return (void*)r;
 }
+
+
+
+// 新增函数
+void krefpage(void *pa) {
+  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+    panic("krefpage");
+  acquire(&refcount.lock);
+  refcount.count[pa2index((uint64)pa)]++;
+  release(&refcount.lock);
+}
+

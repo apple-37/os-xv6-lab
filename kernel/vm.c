@@ -309,34 +309,73 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 // physical memory.
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
-int
-uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
-{
+// 修改uvmcopy()
+int uvmcopy(pagetable_t old, pagetable_t new, uint64 sz) {
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walk(old, i, 0)) == 0)
-      panic("uvmcopy: pte should exist");
-    if((*pte & PTE_V) == 0)
-      panic("uvmcopy: page not present");
+    if((pte = walk(old, i, 0)) == 0) panic("uvmcopy: pte should exist");
+    if((*pte & PTE_V) == 0) panic("uvmcopy: page not present");
+    
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
+    
+    if(flags & PTE_W) {
+      flags = (flags & (~PTE_W)) | PTE_COW;
+      *pte = PA2PTE(pa) | flags;
     }
+    if((*pte & PTE_V) == 0)
+      panic("uvmcopy: page not present");
+    if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0) goto err;
+    krefpage((void*)pa);
   }
   return 0;
-
- err:
+err:
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
+}
+// kernel/vm.c
+int cowfault(pagetable_t pagetable, uint64 va) {
+  pte_t *pte;
+  uint64 pa;
+  char *mem;
+  
+  if(va >= MAXVA)
+    return -1;
+  
+  va = PGROUNDDOWN(va);
+  if((pte = walk(pagetable, va, 0)) == 0)
+    return -1;
+  
+  if(!(*pte & PTE_COW) || !(*pte & PTE_V))
+    return -1;
+  
+  pa = PTE2PA(*pte);
+  if((mem = kalloc()) == 0)
+    return -1;
+  
+  // 确保复制整个页面，包括指令
+  memmove(mem, (char*)pa, PGSIZE);
+  
+  // 保留原有权限，仅修改 COW 和 W 标志
+  uint flags = (PTE_FLAGS(*pte) & ~PTE_COW) | PTE_W;
+  
+  // 确保不意外移除执行权限
+  if(*pte & PTE_X) 
+    flags |= PTE_X;
+  
+  // 原子地更新 PTE
+  *pte = PA2PTE((uint64)mem) | flags;
+  
+  // 确保内存写入完成
+  sfence_vma();
+  
+  // 减少原页面的引用计数
+  kfree((void*)pa);
+  
+  return 0;
 }
 
 // mark a PTE invalid for user access.
@@ -355,32 +394,56 @@ uvmclear(pagetable_t pagetable, uint64 va)
 // Copy from kernel to user.
 // Copy len bytes from src to virtual address dstva in a given page table.
 // Return 0 on success, -1 on error.
+// 修改copyout()
 int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
-  pte_t *pte;
 
   while(len > 0){
+    // 页对齐目标虚拟地址
     va0 = PGROUNDDOWN(dstva);
+
+    // ==== 第一步：检查地址是否非法 ====
     if(va0 >= MAXVA)
       return -1;
-    pte = walk(pagetable, va0, 0);
-    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0 ||
-       (*pte & PTE_W) == 0)
+
+    pa0 = walkaddr(pagetable, va0);
+    if(pa0 == 0)
       return -1;
-    pa0 = PTE2PA(*pte);
+
+    // ==== 第二步：检测 COW 并触发 cowfault ====
+    pte_t *pte = walk(pagetable, va0, 0);
+    if(pte == 0 || (*pte & PTE_V) == 0)
+      return -1;
+
+    if(*pte & PTE_COW){
+      if(cowfault(pagetable, va0) < 0)
+        return -1;
+
+      // 重新获取物理地址（因为 cowfault 重映射了）
+      pa0 = walkaddr(pagetable, va0);
+      if(pa0 == 0)
+        return -1;
+    }
+
+    // ==== 第三步：进行拷贝 ====
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
+
     memmove((void *)(pa0 + (dstva - va0)), src, n);
 
     len -= n;
     src += n;
     dstva = va0 + PGSIZE;
   }
+
   return 0;
 }
+
+
+
 
 // Copy from user to kernel.
 // Copy len bytes to dst from virtual address srcva in a given page table.

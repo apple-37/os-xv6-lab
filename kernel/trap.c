@@ -46,10 +46,10 @@ usertrap(void)
   w_stvec((uint64)kernelvec);
 
   struct proc *p = myproc();
-  
+
   // save user program counter.
   p->trapframe->epc = r_sepc();
-  
+
   if(r_scause() == 8){
     // system call
 
@@ -65,18 +65,48 @@ usertrap(void)
     intr_on();
 
     syscall();
+
   } else if((which_dev = devintr()) != 0){
     // ok
+
+  } else if(r_scause() == 13 || r_scause() == 15){
+    // load/store page fault
+    uint64 va = r_stval();
+    va = PGROUNDDOWN(va);
+
+    if(va >= p->sz || va >= MAXVA){
+      // 非法用户地址访问
+      p->killed = 1;
+
+    } else {
+      pte_t *pte = walk(p->pagetable, va, 0);
+      if(pte == 0 || (*pte & PTE_V) == 0){
+        // 页表项不存在或无效
+        p->killed = 1;
+
+      } else if(*pte & PTE_COW){
+        // Copy-on-Write fault
+        if(cowfault(p->pagetable, va) < 0)
+          p->killed = 1;
+
+      } else {
+        // 非 COW 页面引发的写保护异常
+        p->killed = 1;
+      }
+    }
+
   } else {
+    // 所有未处理 trap 的兜底逻辑
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
-    setkilled(p);
+    p->killed = 1;
   }
 
+  // 如果进程已经被标记为结束，退出
   if(killed(p))
     exit(-1);
 
-  // give up the CPU if this is a timer interrupt.
+  // 如果是定时中断，主动让出 CPU
   if(which_dev == 2)
     yield();
 
