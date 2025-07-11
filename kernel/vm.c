@@ -336,6 +336,10 @@ err:
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
 }
+
+
+
+
 // kernel/vm.c
 int cowfault(pagetable_t pagetable, uint64 va) {
   pte_t *pte;
@@ -349,7 +353,7 @@ int cowfault(pagetable_t pagetable, uint64 va) {
   if((pte = walk(pagetable, va, 0)) == 0)
     return -1;
   
-  if(!(*pte & PTE_COW) || !(*pte & PTE_V))
+  if(!(*pte & PTE_COW) || !(*pte & PTE_V)|| !(*pte & PTE_U))
     return -1;
   
   pa = PTE2PA(*pte);
@@ -401,33 +405,37 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
   uint64 n, va0, pa0;
 
   while(len > 0){
-    // 页对齐目标虚拟地址
     va0 = PGROUNDDOWN(dstva);
 
-    // ==== 第一步：检查地址是否非法 ====
     if(va0 >= MAXVA)
       return -1;
 
+    // === 第一步：获取 PTE 并验证 ===
+    pte_t *pte = walk(pagetable, va0, 0);
+    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
+      return -1;
+
+    // === 第二步：处理 COW 或只读页 ===
+    if((*pte & PTE_W) == 0){
+      if(*pte & PTE_COW){
+        if(cowfault(pagetable, va0) < 0)
+          return -1;
+
+        // COW 完成后，重新获取 PTE
+        pte = walk(pagetable, va0, 0);
+        if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_W) == 0)
+          return -1;
+      } else {
+        // 既不是 COW，也没有写权限，非法写
+        return -1;
+      }
+    }
+
+    // === 第三步：获取物理地址并拷贝 ===
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
 
-    // ==== 第二步：检测 COW 并触发 cowfault ====
-    pte_t *pte = walk(pagetable, va0, 0);
-    if(pte == 0 || (*pte & PTE_V) == 0)
-      return -1;
-
-    if(*pte & PTE_COW){
-      if(cowfault(pagetable, va0) < 0)
-        return -1;
-
-      // 重新获取物理地址（因为 cowfault 重映射了）
-      pa0 = walkaddr(pagetable, va0);
-      if(pa0 == 0)
-        return -1;
-    }
-
-    // ==== 第三步：进行拷贝 ====
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
@@ -441,6 +449,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   return 0;
 }
+
 
 
 
