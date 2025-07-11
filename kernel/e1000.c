@@ -18,7 +18,8 @@ static char *rx_bufs[RX_RING_SIZE];
 // remember where the e1000's registers live.
 static volatile uint32 *regs;
 
-struct spinlock e1000_lock;
+struct spinlock e1000_tx_lock;
+struct spinlock e1000_rx_lock;
 
 // called by pci_init().
 // xregs is the memory address at which the
@@ -28,8 +29,8 @@ e1000_init(uint32 *xregs)
 {
   int i;
 
-  initlock(&e1000_lock, "e1000");
-
+  initlock(&e1000_tx_lock, "e1000_tx");
+  initlock(&e1000_rx_lock, "e1000_rx");
   regs = xregs;
 
   // Reset the device
@@ -91,31 +92,121 @@ e1000_init(uint32 *xregs)
   regs[E1000_IMS] = (1 << 7); // RXDW -- Receiver Descriptor Write Back
 }
 
+
+uint32 e1000_tx_next_tail = 0;
 int
 e1000_transmit(char *buf, int len)
 {
-  //
-  // Your code here.
-  //
-  // buf contains an ethernet frame; program it into
-  // the TX descriptor ring so that the e1000 sends it. Stash
-  // a pointer so that it can be freed after send completes.
-  //
 
+  acquire(&e1000_tx_lock);
+
+  // 获取下一个可用 TX 描述符的索引。
+  uint32 tdt = e1000_tx_next_tail;
+
+  // 检查环是否已满。
+  // 我们检查当前槽位的 '描述符完成' 位 (E1000_TXD_STAT_DD) 是否已设置。
+  // 如果 DD 未设置，则环已满或该描述符尚未完成（仍归硬件所有）。
+  if (!(tx_ring[tdt].status & E1000_TXD_STAT_DD)) {
+    // 无法发送。释放锁并返回失败。
+    release(&e1000_tx_lock);
+    return -1;
+  }
+
+  // 确保数据包长度符合 E1000 要求（如果硬件没有填充，以太网帧最小 60 字节）。
+  // E1000_TCTL_PSP（填充短数据包）在 e1000_init 中已设置，所以此处严格来说不需要最小长度检查，
+  // 但这是良好的实践。
+
+  // 1. 存储缓冲区指针。我们需要它以便稍后释放缓冲区。
+  // 描述符环 `tx_ring` 存储物理地址，`tx_bufs` 存储内核虚拟地址。
+  if (tx_bufs[tdt] != 0 && tx_bufs[tdt] != (char*)0x1) {
+    // 这只会在之前的某个数据包未被释放时发生，意味着存在错误或上述描述符状态检查失败。
+    kfree(tx_bufs[tdt]);
+  }
+  tx_bufs[tdt] = buf; 
+
+  // 2. 配置描述符。
+  // 假设 buf 已经是内核物理地址或标识映射的虚拟地址。
+  tx_ring[tdt].addr = (uint64)buf; 
+  tx_ring[tdt].length = len;
+
+  // 设置控制标志：
+  // EOP (数据包结束) - 这是一个单一数据包
+  // RS (报告状态) - 要求硬件在完成后设置 DD 位
+  tx_ring[tdt].cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_RS;
   
+  // 设置状态为 0 以表示驱动程序拥有它（可选，通常 DD 在初始化或上次使用时已经是 0）
+
+  // 3. 更新尾指针并通知硬件。
+  e1000_tx_next_tail = (tdt + 1) % TX_RING_SIZE;
+  regs[E1000_TDT] = e1000_tx_next_tail;
+
+  release(&e1000_tx_lock);
+
   return 0;
 }
 
 static void
 e1000_recv(void)
 {
-  //
-  // Your code here.
-  //
-  // Check for packets that have arrived from the e1000
-  // Create and deliver a buf for each packet (using net_rx()).
-  //
+  acquire(&e1000_rx_lock);
 
+  // e1000_init 中的接收环管理将 RDT 设置为 SIZE-1，RDH 设置为 0。
+  // 硬件从索引 0 开始填充。我们检查 (RDT + 1) % RX_RING_SIZE 处的描述符以查看接收到的数据包。
+
+  // RDT 是驱动程序最后提供给硬件的描述符索引。
+  uint32 rdt = regs[E1000_RDT]; 
+  // 我们要检查的下一个索引是 (当前 RDT + 1) % RX_RING_SIZE。
+  uint32 next_rdt = (rdt + 1) % RX_RING_SIZE;
+
+  // 遍历硬件已完成写入的所有描述符。
+  // 如果设置了 E1000_RXD_STAT_DD 位，则描述符“已完成”（已接收到数据包）。
+  while (rx_ring[next_rdt].status & E1000_RXD_STAT_DD) {
+    
+    // 检查数据包结束 (EOP) 状态，这是完整数据包所必需的。
+    // 如果是数据包的最后一个缓冲区，通常会设置 E1000_RXD_STAT_EOP。
+    if (!(rx_ring[next_rdt].status & E1000_RXD_STAT_EOP)) {
+        // 此处未处理多描述符数据包。对于 xv6 中的标准以太网帧，这应该是 EOP。
+        panic("e1000_recv: Multi-descriptor packet detected");
+    }
+
+    // 1. 检索接收到的数据包信息。
+    uint32 len = rx_ring[next_rdt].length;
+    char *buf = rx_bufs[next_rdt];
+
+    // 2. 将数据包交付给网络协议栈。net_rx 接受缓冲区和长度。
+    net_rx(buf, len);
+
+    // 3. 为下一个传入数据包准备描述符。
+
+    // 为描述符分配一个新的缓冲区。
+    char *new_buf = kalloc();
+    if (!new_buf) {
+      // 如果无法分配新的缓冲区，则 panic。在 xv6 中，对于关键资源故障，通常会 panic。
+      panic("e1000_recv: kalloc failed for new RX buffer");
+    }
+
+    // 将 rx_bufs 指针更新为新缓冲区
+    rx_bufs[next_rdt] = new_buf;
+    
+    // 使用新缓冲区的物理地址更新描述符。
+    // 之前的缓冲区 (`buf`) 现在归网络协议栈 (`net_rx`) 所有。
+    rx_ring[next_rdt].addr = (uint64)new_buf;
+
+    // 清除状态位以指示描述符已准备好供硬件使用。
+    // 关键是，清除 E1000_RXD_STAT_DD。
+    rx_ring[next_rdt].status = 0; 
+
+    // 将 RDT 索引前进到这个新可用的描述符。
+    rdt = next_rdt;
+    next_rdt = (rdt + 1) % RX_RING_SIZE;
+  }
+
+  // 4. 更新硬件 RDT 寄存器。
+  // 这告诉 E1000 驱动程序在何处提供了可用的缓冲区。
+  // 注意：我们将 RDT 更新为我们处理的 *最后* 一个描述符的索引。
+  regs[E1000_RDT] = rdt;
+
+  release(&e1000_rx_lock);
 }
 
 void
