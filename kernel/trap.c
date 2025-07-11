@@ -78,18 +78,19 @@ usertrap(void)
 
   // give up the CPU if this is a timer interrupt.
   if(which_dev == 2){
-  if(p->alarm_tks > 0){
-    p->alarm_tk_elapsed++;
-    if(p->alarm_tk_elapsed >= p->alarm_tks && !p->alarm_state){ // 注意这里必须是 p->alarm_state 为 0
-      p->alarm_tk_elapsed = 0;
-      *p->alarmframe = *p->trapframe;
-      p->trapframe->epc = p->alarm_handler;
-      p->alarm_state = 1; // 注意这里：改了 epc 就代表开始执行了
+    if(p->alarm_tks > 0){
+
+      p->alarm_tk_elapsed++;
+      if(p->alarm_tk_elapsed >= p->alarm_tks && !p->alarm_state){ // 注意这里必须是 p->alarm_state 为 0
+        p->alarm_tk_elapsed = 0;
+        *p->alarmframe = *p->trapframe;
+        p->trapframe->epc = p->alarm_handler;
+        p->alarm_state = 1; // 注意这里：改了 epc 就代表开始执行了
+      }
     }
-  }
   
-  yield();
-}
+    yield();
+  }
 
   usertrapret();
 }
