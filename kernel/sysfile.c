@@ -301,22 +301,31 @@ create(char *path, short type, short major, short minor)
   return 0;
 }
 
+/// In kernel/sysfile.c
+
+#define MAX_SYMLINK_DEPTH 10 // 定义一个最大递归深度
+
+// open(char *path, int flags)
 uint64
 sys_open(void)
 {
   char path[MAXPATH];
-  int fd, omode;
+  int fd, flags;
   struct file *f;
   struct inode *ip;
-  int n;
 
-  argint(1, &omode);
-  if((n = argstr(0, path, MAXPATH)) < 0)
+  // 分开获取参数，避免 void 返回值问题
+  if(argstr(0, path, MAXPATH) < 0){
     return -1;
+  }
+  argint(1, &flags);
+  if(flags < 0){
+    return -1;
+  }
 
   begin_op();
 
-  if(omode & O_CREATE){
+  if(flags & O_CREATE){
     ip = create(path, T_FILE, 0, 0);
     if(ip == 0){
       end_op();
@@ -328,7 +337,47 @@ sys_open(void)
       return -1;
     }
     ilock(ip);
-    if(ip->type == T_DIR && omode != O_RDONLY){
+    
+    // 循环处理符号链接
+    for (int i = 0; i < MAX_SYMLINK_DEPTH; i++) {
+        if (ip->type != T_SYMLINK) {
+            break; // 找到了最终目标，不是符号链接
+        }
+
+        if (flags & O_NOFOLLOW) {
+            break; // 用户不想跟随链接
+        }
+
+        // 读取链接内容（即目标路径）
+        char target_path[MAXPATH];
+        int len = readi(ip, 0, (uint64)target_path, 0, ip->size);
+        if (len != ip->size) {
+            iunlockput(ip);
+            end_op();
+            return -1;
+        }
+        target_path[len] = '\0';
+
+        // 释放当前符号链接的 inode，准备查找下一个
+        iunlockput(ip);
+        
+        // 用目标路径再次查找 inode
+        ip = namei(target_path);
+        if (ip == 0) {
+            end_op();
+            return -1;
+        }
+        ilock(ip);
+        
+        // 如果循环即将结束，说明链接太深或有环
+        if (i == MAX_SYMLINK_DEPTH - 1) {
+            iunlockput(ip);
+            end_op();
+            return -1;
+        }
+    }
+
+    if(ip->type == T_DIR && flags != O_RDONLY){
       iunlockput(ip);
       end_op();
       return -1;
@@ -340,7 +389,7 @@ sys_open(void)
     end_op();
     return -1;
   }
-
+  
   if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
     if(f)
       fileclose(f);
@@ -357,10 +406,10 @@ sys_open(void)
     f->off = 0;
   }
   f->ip = ip;
-  f->readable = !(omode & O_WRONLY);
-  f->writable = (omode & O_WRONLY) || (omode & O_RDWR);
+  f->readable = !(flags & O_WRONLY);
+  f->writable = (flags & O_WRONLY) || (flags & O_RDWR);
 
-  if((omode & O_TRUNC) && ip->type == T_FILE){
+  if((flags & O_TRUNC) && ip->type == T_FILE){
     itrunc(ip);
   }
 
@@ -501,5 +550,43 @@ sys_pipe(void)
     fileclose(wf);
     return -1;
   }
+  return 0;
+}
+
+uint64
+sys_symlink(void)
+{
+  char target[MAXPATH], path[MAXPATH];
+  struct inode *ip;
+
+  // 从用户空间获取参数
+  if (argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0) {
+    return -1;
+  }
+
+  // 开始一个事务
+  begin_op();
+  
+  // create() 是一个非常有用的辅助函数，它可以创建一个新文件并返回一个锁定的inode。
+  // 我们告诉它我们要创建一个 T_SYMLINK 类型的文件。
+  ip = create(path, T_SYMLINK, 0, 0);
+  if (ip == 0) {
+    end_op();
+    return -1;
+  }
+
+  // 将 target 路径写入到新创建的 inode 的数据块中。
+  // writei() 函数完美地处理了数据块的分配和写入。
+  if (writei(ip, 0, (uint64)target, 0, strlen(target)) != strlen(target)) {
+    iunlockput(ip); // 如果写入失败，解锁并释放inode
+    end_op();
+    return -1;
+  }
+  
+  // 成功，解锁并释放inode
+  iunlockput(ip);
+  // 结束事务
+  end_op();
+
   return 0;
 }

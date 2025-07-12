@@ -379,6 +379,10 @@ iunlockput(struct inode *ip)
 // Return the disk block address of the nth block in inode ip.
 // If there is no such block, bmap allocates one.
 // returns 0 if out of disk space.
+// in kernel/fs.c
+// NDIRECT is 11, NINDIRECT is 256
+
+
 static uint
 bmap(struct inode *ip, uint bn)
 {
@@ -388,8 +392,7 @@ bmap(struct inode *ip, uint bn)
   if(bn < NDIRECT){
     if((addr = ip->addrs[bn]) == 0){
       addr = balloc(ip->dev);
-      if(addr == 0)
-        return 0;
+      if(addr == 0) return 0;
       ip->addrs[bn] = addr;
     }
     return addr;
@@ -400,18 +403,82 @@ bmap(struct inode *ip, uint bn)
     // Load indirect block, allocating if necessary.
     if((addr = ip->addrs[NDIRECT]) == 0){
       addr = balloc(ip->dev);
-      if(addr == 0)
-        return 0;
+      if(addr == 0) return 0;
+      // FIX: Zero the new indirect block
+      bp = bread(ip->dev, addr);
+      memset(bp->data, 0, BSIZE);
+      log_write(bp);
+      brelse(bp);
       ip->addrs[NDIRECT] = addr;
     }
-    bp = bread(ip->dev, addr);
+    
+    bp = bread(ip->dev, ip->addrs[NDIRECT]);
     a = (uint*)bp->data;
     if((addr = a[bn]) == 0){
       addr = balloc(ip->dev);
-      if(addr){
-        a[bn] = addr;
-        log_write(bp);
+      if(addr == 0){
+        brelse(bp);
+        return 0;
       }
+      a[bn] = addr;
+      log_write(bp);
+    }
+    brelse(bp);
+    return addr;
+  }
+  bn -= NINDIRECT;
+
+  if(bn < NINDIRECT * NINDIRECT){
+    // Doubly-indirect block
+    uint l1_addr;
+    struct buf *bp2;
+
+    // Load L2 block
+    if((l1_addr = ip->addrs[NDIRECT+1]) == 0) {
+      l1_addr = balloc(ip->dev);
+      if (l1_addr == 0) return 0;
+      // FIX: Zero the new L2 block
+      bp = bread(ip->dev, l1_addr);
+      memset(bp->data, 0, BSIZE);
+      log_write(bp);
+      brelse(bp);
+      ip->addrs[NDIRECT+1] = l1_addr;
+    }
+
+    bp = bread(ip->dev, l1_addr);
+    a = (uint*)bp->data;
+
+    // Load L1 block
+    if((addr = a[bn / NINDIRECT]) == 0){
+      addr = balloc(ip->dev);
+      if(addr == 0){
+        brelse(bp);
+        return 0;
+      }
+      // FIX: Zero the new L1 block
+      bp2 = bread(ip->dev, addr);
+      memset(bp2->data, 0, BSIZE);
+      log_write(bp2);
+      brelse(bp2);
+      a[bn / NINDIRECT] = addr;
+      log_write(bp); // Update L2 block
+    }
+    // Now 'addr' holds L1 block address, but we need the pointer from the buffer
+    // because it might have been newly allocated.
+    uint data_block_ptr_addr = a[bn / NINDIRECT];
+    brelse(bp);
+
+    // Finally, get the data block
+    bp = bread(ip->dev, data_block_ptr_addr);
+    a = (uint*)bp->data;
+    if((addr = a[bn % NINDIRECT]) == 0){
+      addr = balloc(ip->dev);
+      if(addr == 0){
+        brelse(bp);
+        return 0;
+      }
+      a[bn % NINDIRECT] = addr;
+      log_write(bp);
     }
     brelse(bp);
     return addr;
@@ -419,16 +486,17 @@ bmap(struct inode *ip, uint bn)
 
   panic("bmap: out of range");
 }
-
 // Truncate inode (discard contents).
 // Caller must hold ip->lock.
+// in kernel/fs.c
 void
 itrunc(struct inode *ip)
 {
   int i, j;
-  struct buf *bp;
-  uint *a;
+  struct buf *bp, *bp2;
+  uint *a, *a2;
 
+  // Free direct blocks
   for(i = 0; i < NDIRECT; i++){
     if(ip->addrs[i]){
       bfree(ip->dev, ip->addrs[i]);
@@ -436,6 +504,7 @@ itrunc(struct inode *ip)
     }
   }
 
+  // Free singly-indirect blocks
   if(ip->addrs[NDIRECT]){
     bp = bread(ip->dev, ip->addrs[NDIRECT]);
     a = (uint*)bp->data;
@@ -446,6 +515,33 @@ itrunc(struct inode *ip)
     brelse(bp);
     bfree(ip->dev, ip->addrs[NDIRECT]);
     ip->addrs[NDIRECT] = 0;
+  }
+
+  // Free doubly-indirect blocks (NEW CODE)
+  if(ip->addrs[NDIRECT+1]){
+    // Load the L2 block
+    bp = bread(ip->dev, ip->addrs[NDIRECT+1]);
+    a = (uint*)bp->data;
+    // For each entry in L2 block...
+    for(j = 0; j < NINDIRECT; j++){
+      if(a[j]){
+        // ...load the L1 block
+        bp2 = bread(ip->dev, a[j]);
+        a2 = (uint*)bp2->data;
+        // ...and free all data blocks it points to
+        for(i = 0; i < NINDIRECT; i++){
+          if(a2[i])
+            bfree(ip->dev, a2[i]);
+        }
+        brelse(bp2);
+        // Free the L1 block itself
+        bfree(ip->dev, a[j]);
+      }
+    }
+    brelse(bp);
+    // Free the L2 block itself
+    bfree(ip->dev, ip->addrs[NDIRECT+1]);
+    ip->addrs[NDIRECT+1] = 0;
   }
 
   ip->size = 0;

@@ -55,6 +55,8 @@ binit(void)
 // Look through buffer cache for block on device dev.
 // If not found, allocate a buffer.
 // In either case, return locked buffer.
+// in kernel/bio.c
+
 static struct buf*
 bget(uint dev, uint blockno)
 {
@@ -74,8 +76,14 @@ bget(uint dev, uint blockno)
 
   // Not cached.
   // Recycle the least recently used (LRU) unused buffer.
+  // Loop over buffers from the tail of the LRU list, which are the least recently used.
   for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
-    if(b->refcnt == 0) {
+    // ******************** THE ONLY CHANGE IS HERE ********************
+    // We must check both refcnt and the disk flag.
+    // A buffer with b->disk=1 is currently in use by the disk driver
+    // for an I/O operation, and cannot be recycled.
+    if(b->refcnt == 0 && b->disk == 0) { 
+    // ***************************************************************
       b->dev = dev;
       b->blockno = blockno;
       b->valid = 0;
@@ -85,6 +93,8 @@ bget(uint dev, uint blockno)
       return b;
     }
   }
+  
+  // If we reach here, all buffers are in use.
   panic("bget: no buffers");
 }
 
