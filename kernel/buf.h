@@ -10,3 +10,4 @@ struct buf {
   uchar data[BSIZE];
 };
 
+#define NBUCKETS 13
